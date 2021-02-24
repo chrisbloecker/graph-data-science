@@ -33,17 +33,19 @@ import org.neo4j.graphalgo.beta.k1coloring.K1Coloring;
 import org.neo4j.graphalgo.beta.k1coloring.K1ColoringFactory;
 import org.neo4j.graphalgo.beta.k1coloring.K1ColoringStreamConfig;
 import org.neo4j.graphalgo.core.concurrency.ParallelUtil;
+import org.neo4j.graphalgo.core.utils.AtomicDoubleArray;
 import org.neo4j.graphalgo.core.utils.ProgressLogger;
 import org.neo4j.graphalgo.core.utils.mem.AllocationTracker;
-import org.neo4j.graphalgo.core.utils.paged.HugeAtomicDoubleArray;
-import org.neo4j.graphalgo.core.utils.paged.HugeDoubleArray;
-import org.neo4j.graphalgo.core.utils.paged.HugeLongArray;
-import org.neo4j.graphalgo.core.utils.paged.HugeLongLongMap;
+import org.neo4j.graphalgo.core.utils.paged.*;
 import org.neo4j.graphalgo.core.utils.partition.Partition;
 import org.neo4j.graphalgo.core.utils.partition.PartitionUtils;
+import org.neo4j.graphalgo.pagerank.ImmutablePageRankStreamConfig;
+import org.neo4j.graphalgo.pagerank.PageRank;
+import org.neo4j.graphalgo.pagerank.PageRankFactory;
+import org.neo4j.graphalgo.pagerank.PageRankStreamConfig;
 
-import java.util.ArrayList;
-import java.util.Collection;
+import javax.ws.rs.core.Link;
+import java.util.*;
 import java.util.concurrent.ExecutorService;
 import java.util.stream.Collectors;
 import java.util.stream.LongStream;
@@ -77,14 +79,15 @@ public final class MapEquationOptimization extends Algorithm<MapEquationOptimiza
     private double totalNodeWeight = 0.0;
     private double codelength = -1.0;
     private BitSet colorsUsed;
+    // a mapping from communities to InfoNodes
+    private Map<Integer, InfoNode> infoNodes;
     private HugeLongArray colors;
     private HugeLongArray currentCommunities;
     private HugeLongArray nextCommunities;
     private HugeLongArray reverseSeedCommunityMapping;
-    private HugeDoubleArray cumulativeNodeWeights;
-    private HugeDoubleArray nodeCommunityInfluences;
-    private HugeAtomicDoubleArray communityWeights;
-    private HugeAtomicDoubleArray communityWeightUpdates;
+    private Map<Integer, List<InfoNode>> communityUpdatesMerge;
+    private Map<Integer, List<InfoNode>> communityUpdatesRemove;
+    private HugeAtomicDoubleArray flowDistribution;
 
     public MapEquationOptimization(
         final Graph graph,
@@ -127,9 +130,11 @@ public final class MapEquationOptimization extends Algorithm<MapEquationOptimiza
 
 
         progressLogger.logMessage(":: Initialization :: Start");
+        computeFlowDistribution();
         computeColoring();
         initSeeding();
         init();
+        this.codelength = calculateCodelength();
         progressLogger.logMessage(":: Initialization :: Finished");
 
 
@@ -137,8 +142,6 @@ public final class MapEquationOptimization extends Algorithm<MapEquationOptimiza
             progressLogger.logMessage(formatWithLocale(":: Iteration %d :: Start", iterationCounter + 1));
 
             boolean hasConverged;
-
-            nodeCommunityInfluences.fill(0.0);
 
             long currentColor = colorsUsed.nextSetBit(0);
             while (currentColor != -1) {
@@ -164,6 +167,28 @@ public final class MapEquationOptimization extends Algorithm<MapEquationOptimiza
         return this;
     }
 
+    private void computeFlowDistribution() {
+        PageRankStreamConfig prConfig = ImmutablePageRankStreamConfig
+            .builder()
+            .concurrency(concurrency)
+            .maxIterations(100)
+            .dampingFactor(0.85)
+            .build();
+
+        PageRank pr = new PageRankFactory<>()
+            .build(graph, prConfig, tracker, progressLogger.getLog(), progressLogger.eventTracker())
+            .withTerminationFlag(terminationFlag);
+
+        HugeDoubleArray ar = pr.compute().result().array();
+        double sum = ar.stream().sum();
+        this.flowDistribution = HugeAtomicDoubleArray.newArray(ar.size(), tracker);
+        for (long i = 0; i < ar.size(); ++i)
+            this.flowDistribution.set(i, ar.get(i) / sum);
+
+        getProgressLogger().logMessage("Flow sum is " + Double.toString(sum));
+        getProgressLogger().logMessage("Flow distribution " + this.flowDistribution.toString());
+    }
+
     private void computeColoring() {
         K1ColoringStreamConfig k1Config = ImmutableK1ColoringStreamConfig
             .builder()
@@ -173,7 +198,7 @@ public final class MapEquationOptimization extends Algorithm<MapEquationOptimiza
             .build();
 
         K1Coloring coloring = new K1ColoringFactory<>()
-            .build(graph, k1Config, tracker, progressLogger.getLog())
+            .build(graph, k1Config, tracker, progressLogger.getLog(), progressLogger.eventTracker())
             .withTerminationFlag(terminationFlag);
 
         this.colors = coloring.compute();
@@ -215,28 +240,33 @@ public final class MapEquationOptimization extends Algorithm<MapEquationOptimiza
 
     private void init() {
         this.nextCommunities = HugeLongArray.newArray(nodeCount, tracker);
-        this.cumulativeNodeWeights = HugeDoubleArray.newArray(nodeCount, tracker);
-        this.nodeCommunityInfluences = HugeDoubleArray.newArray(nodeCount, tracker);
-        this.communityWeights = HugeAtomicDoubleArray.newArray(nodeCount, tracker);
-        this.communityWeightUpdates = HugeAtomicDoubleArray.newArray(nodeCount, tracker);
+        this.communityUpdatesMerge = new HashMap<>();
+        this.communityUpdatesRemove = new HashMap<>();
+        this.infoNodes = new HashMap<>();
 
         var initTasks = PartitionUtils.rangePartition(concurrency, nodeCount)
             .stream()
             .map(partition -> new InitTask(
                 graph.concurrentCopy(),
                 currentCommunities,
-                communityWeights,
-                cumulativeNodeWeights,
                 seedProperty != null,
-                partition
+                partition,
+                this.flowDistribution,
+                this.infoNodes
             ))
             .collect(Collectors.toList());
 
         ParallelUtil.run(initTasks, executor);
 
-        var doubleTotalNodeWeight = initTasks.stream().mapToDouble(InitTask::localSum).sum();
+        // we have to do this after the init tasks because start communities are set there.
+        for (int ix = 0; ix < currentCommunities.size(); ++ix)
+        {
+            if (!communityUpdatesMerge.containsKey((int) currentCommunities.get(ix)))
+                this.communityUpdatesMerge.put((int) currentCommunities.get(ix), new LinkedList<>());
+            if (!communityUpdatesRemove.containsKey((int) currentCommunities.get(ix)))
+                this.communityUpdatesRemove.put((int) currentCommunities.get(ix), new LinkedList<>());
+        }
 
-        totalNodeWeight = doubleTotalNodeWeight / 2.0;
         currentCommunities.copyTo(nextCommunities, nodeCount);
     }
 
@@ -246,62 +276,69 @@ public final class MapEquationOptimization extends Algorithm<MapEquationOptimiza
 
         private final HugeLongArray currentCommunities;
 
-        private final HugeAtomicDoubleArray communityWeights;
-
-        private final HugeDoubleArray cumulativeNodeWeights;
-
         private final boolean isSeeded;
 
         private final Partition partition;
 
-        private double localSum;
+        private final HugeAtomicDoubleArray flowDistribution;
+
+        private final Map<Integer, InfoNode> infoNodes;
 
         private InitTask(
             RelationshipIterator relationshipIterator,
             HugeLongArray currentCommunities,
-            HugeAtomicDoubleArray communityWeights,
-            HugeDoubleArray cumulativeNodeWeights,
             boolean isSeeded,
-            Partition partition
+            Partition partition,
+            HugeAtomicDoubleArray flowDistribution,
+            Map<Integer, InfoNode> infoNodes
         ) {
             this.relationshipIterator = relationshipIterator;
             this.currentCommunities = currentCommunities;
-            this.communityWeights = communityWeights;
-            this.cumulativeNodeWeights = cumulativeNodeWeights;
             this.isSeeded = isSeeded;
             this.partition = partition;
-            this.localSum = 0.0D;
+            this.flowDistribution = flowDistribution;
+            this.infoNodes = infoNodes;
         }
 
         @Override
         public void run() {
-            var cumulativeWeight = new MutableDouble();
-
             for (long nodeId = partition.startNode(); nodeId < partition.startNode() + partition.nodeCount(); nodeId++) {
                 if (!isSeeded) {
                     currentCommunities.set(nodeId, nodeId);
                 }
 
-                cumulativeWeight.setValue(0.0D);
+                InfoNode infoNode = new InfoNode();
+                infoNode.addNode((int) nodeId);
+
+                final double nodeFlow = flowDistribution.get(nodeId);
+
+                // summing over outgoing link weights
+                MutableDouble cumulativeWeight = new MutableDouble(0.0);
 
                 relationshipIterator.forEachRelationship(nodeId, 1.0, (s, t, w) -> {
                     cumulativeWeight.add(w);
                     return true;
                 });
 
-                communityWeights.update(
-                    currentCommunities.get(nodeId),
-                    acc -> acc + cumulativeWeight.doubleValue()
-                );
+                // technically, in the following, we should get the respective InfoNode from infoNodes and update its
+                // properties. but since we assume an undirected network, we can do all calculations locally, focused
+                // on only one node.
+                // plus, we would have to secure this against race conditions...
+                //
+                // so we should:
+                // infoNodes.get((int) s).addExitFlow(f)
+                // infoNodes.get((int) t).addEnterFlow(f)
+                // infoNodes.get((int) t).addFlow(f)
+                relationshipIterator.forEachRelationship(nodeId, 1.0, (s, t, w) -> {
+                    final double f = nodeFlow * w / cumulativeWeight.doubleValue();
+                    infoNode.addExitFlow(f);
+                    infoNode.addEnterFlow(f);
+                    infoNode.addFlow(f);
+                    return true;
+                });
 
-                cumulativeNodeWeights.set(nodeId, cumulativeWeight.doubleValue());
-
-                localSum += cumulativeWeight.doubleValue();
+                infoNodes.put((int) nodeId, infoNode);
             }
-        }
-
-        double localSum() {
-            return localSum;
         }
     }
 
@@ -316,18 +353,26 @@ public final class MapEquationOptimization extends Algorithm<MapEquationOptimiza
         // swap old and new communities
         nextCommunities.copyTo(currentCommunities, nodeCount);
 
-        // apply communityWeight updates to communityWeights
-        ParallelUtil.parallelStreamConsume(
-            LongStream.range(0, nodeCount),
-            concurrency,
-            stream -> stream.forEach(nodeId -> {
-                final double update = communityWeightUpdates.get(nodeId);
-                communityWeights.update(nodeId, w -> w + update);
-            })
-        );
+        // apply community updates
+        for (int community = 0; community < communityUpdatesMerge.size(); ++community)
+        {
+            for (InfoNode mergeUpdate : communityUpdatesMerge.get(community))
+            {
+                InfoNode newInfo = infoNodes.get(community).merge(mergeUpdate);
+                infoNodes.put(community, newInfo);
+            }
+            communityUpdatesMerge.get(community).clear();
+        }
 
-        // reset communityWeightUpdates
-        communityWeightUpdates = HugeAtomicDoubleArray.newArray(nodeCount, tracker);
+        for (int community = 0; community < communityUpdatesRemove.size(); ++community)
+        {
+            for (InfoNode removeUpdate : communityUpdatesRemove.get(community))
+            {
+                InfoNode newInfo = infoNodes.get(community).remove(removeUpdate);
+                infoNodes.put(community, newInfo);
+            }
+            communityUpdatesRemove.get(community).clear();
+        }
     }
 
     private Collection<MapEquationOptimizationTask> createMapEquationOptimizationTasks(long currentColor) {
@@ -341,12 +386,12 @@ public final class MapEquationOptimization extends Algorithm<MapEquationOptimiza
                     currentColor,
                     totalNodeWeight,
                     colors,
+                    infoNodes,
                     currentCommunities,
                     nextCommunities,
-                    cumulativeNodeWeights,
-                    nodeCommunityInfluences,
-                    communityWeights,
-                    communityWeightUpdates,
+                    communityUpdatesMerge,
+                    communityUpdatesRemove,
+                    flowDistribution,
                     getProgressLogger()
                 )
             );
@@ -358,32 +403,33 @@ public final class MapEquationOptimization extends Algorithm<MapEquationOptimiza
         double oldCodelength = this.codelength;
         this.codelength = calculateCodelength();
 
-        return this.codelength > oldCodelength && Math.abs(this.codelength - oldCodelength) > tolerance;
+        return this.codelength < oldCodelength
+            && Math.abs(this.codelength - oldCodelength) > tolerance;
     }
 
-    // ToDo[chris] this is what needs to change
-    private double calculateCodelength() {
-        double ex = ParallelUtil.parallelStream(
-            LongStream.range(0, nodeCount),
-            concurrency,
-            nodeStream ->
-                nodeStream
-                    .mapToDouble(nodeCommunityInfluences::get)
-                    .reduce(Double::sum)
-                    .orElseThrow(() -> new RuntimeException("Error while comptuing codelength"))
-        );
+    private double calculateCodelength(){
+        double res = 0.0;
 
-        double ax = ParallelUtil.parallelStream(
-            LongStream.range(0, nodeCount),
-            concurrency,
-            nodeStream ->
-                nodeStream
-                    .mapToDouble(nodeId -> Math.pow(communityWeights.get(nodeId), 2.0))
-                    .reduce(Double::sum)
-                    .orElseThrow(() -> new RuntimeException("Error while comptuing codelength"))
-        );
+        for (InfoNode infoNode: infoNodes.values())
+            res += infoNode.flowLogFlow()   // IV. "flow_log_flow"
+                -  infoNode.enterLogEnter() //  I. "enter_log_enter"
+                -  infoNode.exitLogExit();  // II. "exit_log_exit"
 
-        return (ex / (2 * totalNodeWeight)) - (ax / (Math.pow(2 * totalNodeWeight, 2)));
+        // III. "enterFlow_log_enterFlow"
+        double inFlowSum = 0.0;
+        for (InfoNode infoNode : infoNodes.values())
+            inFlowSum += infoNode.enterFlow();
+        res += inFlowSum * Math.log(inFlowSum) / Math.log(2);
+
+        // V. "nodeFlow_log_nodeFlow"
+        double f;
+        for (int ix = 0; ix < flowDistribution.size(); ++ix)
+        {
+            f = flowDistribution.get(ix);
+            res -= f * Math.log(f) / Math.log(2);
+        }
+
+        return res;
     }
 
     @Override
@@ -394,12 +440,9 @@ public final class MapEquationOptimization extends Algorithm<MapEquationOptimiza
     @Override
     public void release() {
         this.nextCommunities.release();
-        this.communityWeights.release();
-        this.communityWeightUpdates.release();
-        this.cumulativeNodeWeights.release();
-        this.nodeCommunityInfluences.release();
         this.colors.release();
         this.colorsUsed = null;
+        this.flowDistribution.release();
     }
 
     public long getCommunityId(long nodeId) {

@@ -32,6 +32,7 @@ import org.neo4j.graphalgo.core.utils.mem.AllocationTracker;
 import org.neo4j.graphalgo.core.utils.paged.HugeAtomicDoubleArray;
 import org.neo4j.graphalgo.core.utils.paged.HugeDoubleArray;
 import org.neo4j.graphalgo.core.utils.paged.HugeLongArray;
+import org.neo4j.graphalgo.core.utils.progress.ProgressEventTracker;
 import org.neo4j.logging.Log;
 
 public class MapEquationOptimizationFactory<T extends MapEquationOptimizationConfig> implements AlgorithmFactory<MapEquationOptimization, T> {
@@ -68,22 +69,37 @@ public class MapEquationOptimizationFactory<T extends MapEquationOptimizationCon
     }
 
     @Override
-    public MapEquationOptimization build(Graph graph, T configuration, AllocationTracker tracker, Log log) {
+    public MapEquationOptimization build(
+        Graph graph,
+        T configuration,
+        AllocationTracker tracker,
+        Log log,
+        ProgressEventTracker eventTracker
+    ) {
         return build(
             graph,
             configuration,
             configuration.seedProperty() != null ? graph.nodeProperties(configuration.seedProperty()) : null,
             tracker,
-            log
+            log,
+            eventTracker
         );
     }
 
-    public MapEquationOptimization build(Graph graph, T configuration, NodeProperties seed, AllocationTracker tracker, Log log) {
+    public MapEquationOptimization build(
+        Graph graph,
+        T configuration,
+        NodeProperties seed,
+        AllocationTracker tracker,
+        Log log,
+        ProgressEventTracker eventTracker
+    ) {
         var progressLogger = new BatchingProgressLogger(
             log,
             graph.relationshipCount(),
             "MapEquationOptimization",
-            configuration.concurrency()
+            configuration.concurrency(),
+            eventTracker
         );
 
         return new MapEquationOptimization(

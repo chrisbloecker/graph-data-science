@@ -39,6 +39,7 @@ import org.neo4j.graphalgo.core.utils.mem.MemoryEstimations;
 import org.neo4j.graphalgo.core.utils.mem.MemoryRange;
 import org.neo4j.graphalgo.core.utils.mem.AllocationTracker;
 import org.neo4j.graphalgo.core.utils.paged.HugeLongArray;
+import org.neo4j.graphalgo.core.utils.progress.ProgressEventTracker;
 import org.neo4j.logging.Log;
 
 public class InfomapFactory<CONFIG extends InfomapBaseConfig> implements AlgorithmFactory<Infomap, CONFIG> {
@@ -48,10 +49,15 @@ public class InfomapFactory<CONFIG extends InfomapBaseConfig> implements Algorit
         final Graph graph,
         final InfomapBaseConfig configuration,
         final AllocationTracker tracker,
-        final Log log
+        final Log log,
+        ProgressEventTracker eventTracker
     ) {
-        var progressLogger = new BatchingProgressLogger(log, 1, "Infomap",
-            configuration.concurrency()
+        var progressLogger = new BatchingProgressLogger(
+            log,
+            1,
+            "Infomap",
+            configuration.concurrency(),
+            eventTracker
         );
 
         return new Infomap(

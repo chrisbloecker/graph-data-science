@@ -30,6 +30,9 @@ import org.neo4j.graphalgo.core.utils.paged.HugeAtomicDoubleArray;
 import org.neo4j.graphalgo.core.utils.paged.HugeDoubleArray;
 import org.neo4j.graphalgo.core.utils.paged.HugeLongArray;
 
+import java.lang.reflect.Array;
+import java.util.*;
+
 final class MapEquationOptimizationTask implements Runnable {
 
     private final Graph graph;
@@ -38,14 +41,14 @@ final class MapEquationOptimizationTask implements Runnable {
     private final long batchEnd;
     private final long color;
     private final double totalNodeWeight;
+    private final Map<Integer, InfoNode> infoNodes;
     private final HugeLongArray colors;
     private final ProgressLogger progressLogger;
     private final HugeLongArray currentCommunities;
     private final HugeLongArray nextCommunities;
-    private final HugeDoubleArray cumulativeNodeWeights;
-    private final HugeDoubleArray nodeCommunityInfluences;
-    private final HugeAtomicDoubleArray communityWeights;
-    private final HugeAtomicDoubleArray communityWeightUpdates;
+    private final Map<Integer, List<InfoNode>> communityUpdatesMerge;
+    private final Map<Integer, List<InfoNode>> communityUpdatesRemove;
+    private final HugeAtomicDoubleArray flowDistribution;
 
     MapEquationOptimizationTask(
         Graph graph,
@@ -54,96 +57,178 @@ final class MapEquationOptimizationTask implements Runnable {
         long color,
         double totalNodeWeight,
         HugeLongArray colors,
+        Map<Integer, InfoNode> infoNodes,
         HugeLongArray currentCommunities,
         HugeLongArray nextCommunities,
-        HugeDoubleArray cumulativeNodeWeights,
-        HugeDoubleArray nodeCommunityInfluences,
-        HugeAtomicDoubleArray communityWeights,
-        HugeAtomicDoubleArray communityWeightUpdates,
+        Map<Integer, List<InfoNode>> communityUpdatesMerge,
+        Map<Integer, List<InfoNode>> communityUpdatesRemove,
+        HugeAtomicDoubleArray flowDistribution,
         ProgressLogger progressLogger
     ) {
         this.graph = graph;
         this.batchStart = batchStart;
         this.batchEnd = batchEnd;
+        this.infoNodes = infoNodes;
         this.color = color;
         this.localGraph = graph.concurrentCopy();
         this.currentCommunities = currentCommunities;
         this.nextCommunities = nextCommunities;
-        this.communityWeights = communityWeights;
-        this.communityWeightUpdates = communityWeightUpdates;
+        this.communityUpdatesMerge = communityUpdatesMerge;
+        this.communityUpdatesRemove = communityUpdatesRemove;
         this.totalNodeWeight = totalNodeWeight;
-        this.cumulativeNodeWeights = cumulativeNodeWeights;
-        this.nodeCommunityInfluences = nodeCommunityInfluences;
+        this.flowDistribution = flowDistribution;
         this.colors = colors;
         this.progressLogger = progressLogger;
     }
 
     @Override
     public void run() {
-        LongDoubleMap reuseCommunityInfluences = new LongDoubleHashMap(50);
-        for (long nodeId = batchStart; nodeId < batchEnd; nodeId++) {
+        // part III. for the deltas before moving a node, index level
+        double part3Old = 0.0;
+        // block to restrict visibility of inner
+        {
+            double inner = 0.0; // sum over all entry rates
+            for (InfoNode infoNode : infoNodes.values())
+                inner += infoNode.enterFlow();
+            part3Old += inner * Math.log(inner) / Math.log(2);
+        }
 
+        for (long nodeId = batchStart; nodeId < batchEnd; nodeId++)
+        {
+            // Seems like this task is only trying to move nodes that have a certain colour. I think the idea is that,
+            // since neighbouring nodes do not have the same colour, we can avoid some bad situations with this. Not
+            // sure how much this addresses problems that come with parallelisation.
             if (colors.get(nodeId) != color) {
                 continue;
             }
 
             long currentCommunity = currentCommunities.get(nodeId);
-            final int degree = graph.degree(nodeId);
+            Set<Long> neighbourCommunities = new TreeSet<>();
+            MutableDouble nodeStrength = new MutableDouble(0.0);
+            final double nodeFlow = infoNodes.get((int) nodeId).flow();
 
-            LongDoubleMap communityInfluences;
-            if (degree < 50) {
-                reuseCommunityInfluences.clear();
-                communityInfluences = reuseCommunityInfluences;
-            } else {
-                communityInfluences = new LongDoubleHashMap(degree);
-            }
-            MutableDouble selfWeight = new MutableDouble(0.0D);
+            // pull out the edges so we can actually see what's going on
+            Map<Long, Double> edges = new HashMap<>();
 
-            // calculate influence of this node w.r.t its neighbours communities
+            // figure out which communities are neighbours of this community because we will try to move this node there
             localGraph.forEachRelationship(nodeId, 1.0D, (s, t, w) -> {
-                if (s == t) {
-                    selfWeight.add(w);
-                }
-                long targetCommunity = currentCommunities.get(t);
-                communityInfluences.addTo(targetCommunity, w);
+                neighbourCommunities.add(currentCommunities.get(t));
+                nodeStrength.add(w);
+                edges.put(t, w);
                 return true;
             });
 
+            // don't check the own community
+            neighbourCommunities.remove(currentCommunity);
+
+            // where should we move the current node?
             long nextCommunity = currentCommunity;
-            double currentGain;
             double maxGain = 0.0;
-            double eix = communityInfluences.get(currentCommunity) - selfWeight.doubleValue();
-            double cumulativeNodeWeight = cumulativeNodeWeights.get(nodeId);
-            double ax = communityWeights.get(currentCommunity) - cumulativeNodeWeight;
-            double eiy;
-            double ay;
+            // deltas for the best moves
+            InfoNode currentDelta = new InfoNode();
+            InfoNode nextDelta = new InfoNode();
 
-            long communityCandidate;
-            for (LongDoubleCursor cursor : communityInfluences) {
-                communityCandidate = cursor.key;
+            // calculate deltas for all neighbour communities
+            // we assume an undirected network, or rather: if there is a link (s, t, w), then there is also (t, s, w)!
+            for (long candidateCommunity : neighbourCommunities)
+            {
+                double currentGain = 0.0;
 
-                if (currentCommunity != communityCandidate) {
-                    ay = communityWeights.get(communityCandidate);
-                    eiy = cursor.value;
-                    currentGain =
-                        (eiy - eix) / totalNodeWeight
-                        + (2 * cumulativeNodeWeight * ax - 2 * cumulativeNodeWeight * ay) / Math.pow(
-                            2 * totalNodeWeight,
-                            2
-                        );
+                InfoNode deltaCurrentCommunity = new InfoNode();
+                deltaCurrentCommunity.addNode((int) nodeId);
+                deltaCurrentCommunity.addFlow(-nodeFlow);
 
-                    if ((currentGain > maxGain) || (currentGain == maxGain && currentGain != 0.0 && nextCommunity > communityCandidate)) {
-                        maxGain = currentGain;
-                        nextCommunity = communityCandidate;
+                InfoNode deltaCandidateCommunity = new InfoNode();
+                deltaCandidateCommunity.addNode((int) nodeId);
+                deltaCandidateCommunity.addFlow(nodeFlow);
+
+                //localGraph.forEachRelationship(nodeId, 1.0D, (s, t, w) -> {
+                for (Long t : edges.keySet()) {
+                    double w = nodeFlow * edges.get(t) / nodeStrength.doubleValue();
+                    // the link is within currentCommunity [case (a)]
+                    //  -> it will be between currentCommunity and candidateCommunity after moving
+                    if (currentCommunities.get(t) == currentCommunity) {
+                        deltaCurrentCommunity.addEnterFlow(w);
+                        deltaCurrentCommunity.addExitFlow(w);
+                        deltaCandidateCommunity.addEnterFlow(w);
+                        deltaCandidateCommunity.addExitFlow(w);
                     }
+                    // the link is between currentCommunity and candidateCommunity [case (b)]
+                    //  -> it will be within candidateCommunity after moving
+                    else if (currentCommunities.get(t) == candidateCommunity) {
+                        deltaCurrentCommunity.addEnterFlow(-w);
+                        deltaCurrentCommunity.addExitFlow(-w);
+                        deltaCandidateCommunity.addEnterFlow(-w);
+                        deltaCandidateCommunity.addExitFlow(-w);
+                    }
+                    // the link is between currentCommunity and some other community that is not candidateCommunity
+                    //  -> it will be between candidateCommunity and that other community after moving
+                    else {
+                        deltaCurrentCommunity.addEnterFlow(-w);
+                        deltaCurrentCommunity.addExitFlow(-w);
+                        deltaCandidateCommunity.addEnterFlow(w);
+                        deltaCandidateCommunity.addExitFlow(w);
+                    }
+                }
+                //    return true;
+                //});
+
+                InfoNode currentCommunityOld   = infoNodes.get((int) currentCommunity);
+                InfoNode candidateCommunityOld = infoNodes.get((int) candidateCommunity);
+                InfoNode currentCommunityNew   = currentCommunityOld.remove(deltaCurrentCommunity);
+                InfoNode candidateCommunityNew = candidateCommunityOld.merge(deltaCandidateCommunity);
+
+                // remove codelength influences from the old structure
+                // I.
+                currentGain += currentCommunityOld.enterLogEnter()
+                            +  candidateCommunityOld.enterLogEnter()
+                            -  currentCommunityNew.enterLogEnter()
+                            -  candidateCommunityNew.enterLogEnter();
+
+                // II.
+                currentGain += currentCommunityOld.exitLogExit()
+                            +  candidateCommunityOld.exitLogExit()
+                            -  currentCommunityNew.exitLogExit()
+                            -  candidateCommunityNew.exitLogExit();
+
+                // III.
+                double part3New = 0.0;
+                {
+                    double inner = 0.0;
+                    for (int community = 0; community < infoNodes.size(); ++community)
+                        if (community != currentCommunity && community != candidateCommunity)
+                            inner += infoNodes.get(community).enterFlow();
+                    inner += currentCommunityNew.enterFlow()
+                          +  candidateCommunityNew.enterFlow();
+                    for (int community = 0; community < infoNodes.size(); ++community)
+                        if (community != currentCommunity && community != candidateCommunity)
+                            part3New += infoNodes.get(community).enterFlow() * Math.log(inner) / Math.log(2);
+                    part3New += currentCommunityNew.enterFlow() * Math.log(inner) / Math.log(2)
+                             +  candidateCommunityNew.enterFlow() * Math.log(inner) / Math.log(2);
+                }
+                currentGain += part3Old
+                            -  part3New;
+
+                // IV.
+                currentGain += currentCommunityOld.flowLogFlow()
+                            +  candidateCommunityOld.flowLogFlow()
+                            -  currentCommunityNew.flowLogFlow()
+                            -  candidateCommunityNew.flowLogFlow();
+
+                if ((currentGain < maxGain) || (currentGain == maxGain && currentGain != 0.0 && nextCommunity > candidateCommunity)) {
+                    maxGain = currentGain;
+                    nextCommunity = candidateCommunity;
+                    currentDelta = deltaCurrentCommunity;
+                    nextDelta = deltaCandidateCommunity;
                 }
             }
 
-            nodeCommunityInfluences.set(nodeId, communityInfluences.get(nextCommunity));
-
-            nextCommunities.set(nodeId, nextCommunity);
-            communityWeightUpdates.update(currentCommunity, agg -> agg - cumulativeNodeWeight);
-            communityWeightUpdates.update(nextCommunity, agg -> agg + cumulativeNodeWeight);
+            if (nextCommunity != currentCommunity)
+            {
+                nextCommunities.set(nodeId, nextCommunity);
+                communityUpdatesMerge.get((int) nextCommunity).add(nextDelta);
+                communityUpdatesRemove.get((int) currentCommunity).add(currentDelta);
+            }
             progressLogger.logProgress(graph.degree(nodeId));
         }
 

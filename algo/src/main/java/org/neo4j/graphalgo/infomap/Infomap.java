@@ -22,6 +22,7 @@ package org.neo4j.graphalgo.infomap;
 import org.neo4j.graphalgo.Algorithm;
 import org.neo4j.graphalgo.Orientation;
 import org.neo4j.graphalgo.api.Graph;
+import org.neo4j.graphalgo.api.NodeMapping;
 import org.neo4j.graphalgo.api.NodeProperties;
 import org.neo4j.graphalgo.api.RelationshipIterator;
 import org.neo4j.graphalgo.api.nodeproperties.LongNodeProperties;
@@ -179,7 +180,8 @@ public final class Infomap extends Algorithm<Infomap, Infomap> {
                 mapEquationOptimizationConfig,
                 seed,
                 tracker,
-                progressLogger.getLog()
+                progressLogger.getLog(),
+                progressLogger.eventTracker()
             ).withTerminationFlag(terminationFlag);
 
         mapEquationOptimization.compute();
@@ -208,7 +210,7 @@ public final class Infomap extends Algorithm<Infomap, Infomap> {
         assertRunning();
 
         Orientation orientation = rootGraph.isUndirected() ? Orientation.UNDIRECTED : Orientation.NATURAL;
-        IdMap idMap = nodesBuilder.build();
+        NodeMapping idMap = nodesBuilder.build();
         RelationshipsBuilder relationshipsBuilder = GraphFactory.initRelationshipsBuilder()
             .nodes(idMap)
             .orientation(orientation)
