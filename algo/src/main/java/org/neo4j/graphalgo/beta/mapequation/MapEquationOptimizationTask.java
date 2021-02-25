@@ -36,6 +36,8 @@ import java.util.*;
 final class MapEquationOptimizationTask implements Runnable {
 
     private final Graph graph;
+    private final Map<Long, Map<Long, Double>> predecessors;
+    private final Map<Long, Map<Long, Double>> successors;
     private final RelationshipIterator localGraph;
     private final long batchStart;
     private final long batchEnd;
@@ -43,33 +45,40 @@ final class MapEquationOptimizationTask implements Runnable {
     private final double totalNodeWeight;
     private final Map<Integer, InfoNode> infoNodes;
     private final HugeLongArray colors;
+    private final HugeDoubleArray nodeStrengths;
     private final ProgressLogger progressLogger;
     private final HugeLongArray currentCommunities;
     private final HugeLongArray nextCommunities;
     private final Map<Integer, List<InfoNode>> communityUpdatesMerge;
     private final Map<Integer, List<InfoNode>> communityUpdatesRemove;
-    private final HugeAtomicDoubleArray flowDistribution;
+    private final HugeDoubleArray flowDistribution;
 
     MapEquationOptimizationTask(
         Graph graph,
+        Map<Long, Map<Long, Double>> predecessors,
+        Map<Long, Map<Long, Double>> successors,
         long batchStart,
         long batchEnd,
         long color,
         double totalNodeWeight,
         HugeLongArray colors,
+        HugeDoubleArray nodeStrengths,
         Map<Integer, InfoNode> infoNodes,
         HugeLongArray currentCommunities,
         HugeLongArray nextCommunities,
         Map<Integer, List<InfoNode>> communityUpdatesMerge,
         Map<Integer, List<InfoNode>> communityUpdatesRemove,
-        HugeAtomicDoubleArray flowDistribution,
+        HugeDoubleArray flowDistribution,
         ProgressLogger progressLogger
     ) {
         this.graph = graph;
+        this.predecessors = predecessors;
+        this.successors = successors;
         this.batchStart = batchStart;
         this.batchEnd = batchEnd;
         this.infoNodes = infoNodes;
         this.color = color;
+        this.nodeStrengths = nodeStrengths;
         this.localGraph = graph.concurrentCopy();
         this.currentCommunities = currentCommunities;
         this.nextCommunities = nextCommunities;
@@ -102,21 +111,15 @@ final class MapEquationOptimizationTask implements Runnable {
                 continue;
             }
 
-            long currentCommunity = currentCommunities.get(nodeId);
-            Set<Long> neighbourCommunities = new TreeSet<>();
-            MutableDouble nodeStrength = new MutableDouble(0.0);
-            final double nodeFlow = flowDistribution.get((int) nodeId);
-
-            // pull out the edges so we can actually see what's going on
-            Map<Long, Double> edges = new HashMap<>();
+            final long currentCommunity = currentCommunities.get(nodeId);
+            final double nodeFlow = flowDistribution.get(nodeId);
 
             // figure out which communities are neighbours of this community because we will try to move this node there
-            localGraph.forEachRelationship(nodeId, 1.0D, (s, t, w) -> {
-                neighbourCommunities.add(currentCommunities.get(t));
-                nodeStrength.add(w);
-                edges.put(t, w);
-                return true;
-            });
+            Set<Long> neighbourCommunities = new TreeSet<>();
+            for (long neighbour : predecessors.get(nodeId).keySet())
+                neighbourCommunities.add(currentCommunities.get(neighbour));
+            for (long neighbour : successors.get(nodeId).keySet())
+                neighbourCommunities.add(currentCommunities.get(neighbour));
 
             // don't check the own community
             neighbourCommunities.remove(currentCommunity);
@@ -142,36 +145,51 @@ final class MapEquationOptimizationTask implements Runnable {
                 deltaCandidateCommunity.addNode((int) nodeId);
                 deltaCandidateCommunity.addFlow(nodeFlow);
 
-                //localGraph.forEachRelationship(nodeId, 1.0D, (s, t, w) -> {
-                for (Long t : edges.keySet()) {
-                    double w = nodeFlow * edges.get(t) / nodeStrength.doubleValue();
+                for (Long t : successors.get(nodeId).keySet())
+                {
+                    double w = nodeFlow * successors.get(nodeId).get(t) / nodeStrengths.get(nodeId);
                     // the link is within currentCommunity [case (a)]
                     //  -> it will be between currentCommunity and candidateCommunity after moving
                     if (currentCommunities.get(t) == currentCommunity) {
                         deltaCurrentCommunity.addEnterFlow(w);
-                        deltaCurrentCommunity.addExitFlow(w);
-                        deltaCandidateCommunity.addEnterFlow(w);
                         deltaCandidateCommunity.addExitFlow(w);
                     }
                     // the link is between currentCommunity and candidateCommunity [case (b)]
                     //  -> it will be within candidateCommunity after moving
                     else if (currentCommunities.get(t) == candidateCommunity) {
-                        deltaCurrentCommunity.addEnterFlow(-w);
                         deltaCurrentCommunity.addExitFlow(-w);
                         deltaCandidateCommunity.addEnterFlow(-w);
+                    }
+                    // the link is between currentCommunity and some other community that is not candidateCommunity
+                    //  -> it will be between candidateCommunity and that other community after moving
+                    else {
+                        deltaCurrentCommunity.addExitFlow(-w);
+                        deltaCandidateCommunity.addExitFlow(w);
+                    }
+                }
+
+                for (Long s : predecessors.get(nodeId).keySet())
+                {
+                    double w = flowDistribution.get(s) * predecessors.get(nodeId).get(s) / nodeStrengths.get(s);
+                    // the link is within currentCommunity [case (a)]
+                    //  -> it will be between currentCommunity and candidateCommunity after moving
+                    if (currentCommunities.get(s) == currentCommunity) {
+                        deltaCurrentCommunity.addExitFlow(w);
+                        deltaCandidateCommunity.addEnterFlow(w);
+                    }
+                    // the link is between currentCommunity and candidateCommunity [case (b)]
+                    //  -> it will be within candidateCommunity after moving
+                    else if (currentCommunities.get(s) == candidateCommunity) {
+                        deltaCurrentCommunity.addEnterFlow(-w);
                         deltaCandidateCommunity.addExitFlow(-w);
                     }
                     // the link is between currentCommunity and some other community that is not candidateCommunity
                     //  -> it will be between candidateCommunity and that other community after moving
                     else {
                         deltaCurrentCommunity.addEnterFlow(-w);
-                        deltaCurrentCommunity.addExitFlow(-w);
                         deltaCandidateCommunity.addEnterFlow(w);
-                        deltaCandidateCommunity.addExitFlow(w);
                     }
                 }
-                //    return true;
-                //});
 
                 InfoNode currentCommunityOld   = infoNodes.get((int) currentCommunity);
                 InfoNode candidateCommunityOld = infoNodes.get((int) candidateCommunity);

@@ -54,7 +54,8 @@ public class InfoNode {
         double f = this.exitFlow + this.flow;
         return Math.abs(f) < Math.ulp(1.0D)
              ? 0.0
-             : f * Math.log(f) / Math.log(2);
+             : f * Math.log(f) / Math.log(2)
+             ;
     }
 
     public void addNode(int nodeId)

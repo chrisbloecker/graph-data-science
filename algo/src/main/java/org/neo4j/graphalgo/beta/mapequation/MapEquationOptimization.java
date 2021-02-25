@@ -87,7 +87,10 @@ public final class MapEquationOptimization extends Algorithm<MapEquationOptimiza
     private HugeLongArray reverseSeedCommunityMapping;
     private Map<Integer, List<InfoNode>> communityUpdatesMerge;
     private Map<Integer, List<InfoNode>> communityUpdatesRemove;
-    private HugeAtomicDoubleArray flowDistribution;
+    private HugeDoubleArray nodeStrengths;
+    private HugeDoubleArray flowDistribution;
+    private Map<Long, Map<Long, Double>> predecessors;
+    private Map<Long, Map<Long, Double>> successors;
 
     public MapEquationOptimization(
         final Graph graph,
@@ -181,7 +184,7 @@ public final class MapEquationOptimization extends Algorithm<MapEquationOptimiza
 
         HugeDoubleArray ar = pr.compute().result().array();
         double sum = ar.stream().sum();
-        this.flowDistribution = HugeAtomicDoubleArray.newArray(ar.size(), tracker);
+        this.flowDistribution = HugeDoubleArray.newArray(ar.size(), tracker);
         for (long i = 0; i < ar.size(); ++i)
             this.flowDistribution.set(i, ar.get(i) / sum);
 
@@ -242,7 +245,26 @@ public final class MapEquationOptimization extends Algorithm<MapEquationOptimiza
         this.nextCommunities = HugeLongArray.newArray(nodeCount, tracker);
         this.communityUpdatesMerge = new HashMap<>();
         this.communityUpdatesRemove = new HashMap<>();
-        this.infoNodes = new HashMap<>();
+        this.infoNodes     = new HashMap<>();
+        this.nodeStrengths = HugeDoubleArray.newArray(graph.nodeCount(), tracker);
+        this.predecessors  = new HashMap<>();
+        this.successors    = new HashMap<>();
+
+        graph.forEachNode(nodeId -> {
+            this.predecessors.put(nodeId, new HashMap<>());
+            this.successors.put(nodeId, new HashMap<>());
+            return true;
+        });
+
+        graph.forEachNode(nodeId -> {
+            graph.forEachRelationship(nodeId, 1.0D, (s, t, w) -> {
+                this.nodeStrengths.addTo(nodeId, w);
+                this.predecessors.get(t).put(s, w);
+                this.successors.get(s).put(t, w);
+                return true;
+            });
+            return true;
+        });
 
         var initTasks = PartitionUtils.rangePartition(concurrency, nodeCount)
             .stream()
@@ -280,7 +302,7 @@ public final class MapEquationOptimization extends Algorithm<MapEquationOptimiza
 
         private final Partition partition;
 
-        private final HugeAtomicDoubleArray flowDistribution;
+        private final HugeDoubleArray flowDistribution;
 
         private final Map<Integer, InfoNode> infoNodes;
 
@@ -289,7 +311,7 @@ public final class MapEquationOptimization extends Algorithm<MapEquationOptimiza
             HugeLongArray currentCommunities,
             boolean isSeeded,
             Partition partition,
-            HugeAtomicDoubleArray flowDistribution,
+            HugeDoubleArray flowDistribution,
             Map<Integer, InfoNode> infoNodes
         ) {
             this.relationshipIterator = relationshipIterator;
@@ -381,11 +403,14 @@ public final class MapEquationOptimization extends Algorithm<MapEquationOptimiza
             tasks.add(
                 new MapEquationOptimizationTask(
                     graph,
+                    predecessors,
+                    successors,
                     i,
                     Math.min(i + batchSize, nodeCount),
                     currentColor,
                     totalNodeWeight,
                     colors,
+                    nodeStrengths,
                     infoNodes,
                     currentCommunities,
                     nextCommunities,
@@ -441,6 +466,7 @@ public final class MapEquationOptimization extends Algorithm<MapEquationOptimiza
     public void release() {
         this.nextCommunities.release();
         this.colors.release();
+        this.nodeStrengths.release();
         this.colorsUsed = null;
         this.flowDistribution.release();
     }
