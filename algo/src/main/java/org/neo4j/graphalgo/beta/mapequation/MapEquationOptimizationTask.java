@@ -90,7 +90,7 @@ final class MapEquationOptimizationTask implements Runnable {
             double inner = 0.0; // sum over all entry rates
             for (InfoNode infoNode : infoNodes.values())
                 inner += infoNode.enterFlow();
-            part3Old += inner * Math.log(inner) / Math.log(2);
+            part3Old = inner * Math.log(inner) / Math.log(2);
         }
 
         for (long nodeId = batchStart; nodeId < batchEnd; nodeId++)
@@ -105,7 +105,7 @@ final class MapEquationOptimizationTask implements Runnable {
             long currentCommunity = currentCommunities.get(nodeId);
             Set<Long> neighbourCommunities = new TreeSet<>();
             MutableDouble nodeStrength = new MutableDouble(0.0);
-            final double nodeFlow = infoNodes.get((int) nodeId).flow();
+            final double nodeFlow = flowDistribution.get((int) nodeId);
 
             // pull out the edges so we can actually see what's going on
             Map<Long, Double> edges = new HashMap<>();
@@ -200,14 +200,9 @@ final class MapEquationOptimizationTask implements Runnable {
                             inner += infoNodes.get(community).enterFlow();
                     inner += currentCommunityNew.enterFlow()
                           +  candidateCommunityNew.enterFlow();
-                    for (int community = 0; community < infoNodes.size(); ++community)
-                        if (community != currentCommunity && community != candidateCommunity)
-                            part3New += infoNodes.get(community).enterFlow() * Math.log(inner) / Math.log(2);
-                    part3New += currentCommunityNew.enterFlow() * Math.log(inner) / Math.log(2)
-                             +  candidateCommunityNew.enterFlow() * Math.log(inner) / Math.log(2);
+                    part3New = inner * Math.log(inner) / Math.log(2);
                 }
-                currentGain += part3Old
-                            -  part3New;
+                currentGain += part3Old - part3New;
 
                 // IV.
                 currentGain += currentCommunityOld.flowLogFlow()
