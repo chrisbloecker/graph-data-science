@@ -132,7 +132,8 @@ final class MapEquationOptimizationTask implements Runnable {
             InfoNode nextDelta = new InfoNode();
 
             // calculate deltas for all neighbour communities
-            // we assume an undirected network, or rather: if there is a link (s, t, w), then there is also (t, s, w)!
+            // since neo4j uses recorded node teleportation in PageRank, we extract links to work with them directly
+            // because the assumption that flows are symmetric doesn't hold, not even in effectively undirected graphs.
             for (long candidateCommunity : neighbourCommunities)
             {
                 double currentGain = 0.0;
